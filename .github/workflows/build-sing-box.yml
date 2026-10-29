@@ -1,0 +1,170 @@
+name: Build sing-box with v2ray api
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Rebuild the same upstream version
+        type: boolean
+        default: false
+  schedule:
+    # 每天 03:20 UTC，配合 should_build 比对，无新版自动跳过
+    - cron: "20 3 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  check-build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl tar gzip
+
+      - name: Get latest upstream release
+        id: latest
+        run: |
+          latest_tag=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+          echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
+          echo "version=${latest_tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Get current release in this repo and decide whether to build
+        id: current
+        run: |
+          current_tag=$(curl -fsSL https://api.github.com/repos/${{ github.repository }}/releases/latest 2>/dev/null | jq -r '.tag_name // empty' || true)
+          echo "tag=$current_tag" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ inputs.force_build }}" != "true" ] && [ "${{ steps.latest.outputs.tag }}" = "$current_tag" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Already latest: $current_tag"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Need build: upstream=${{ steps.latest.outputs.tag }}, current=${current_tag:-none}"
+          fi
+
+      - name: Show skip reason
+        if: steps.current.outputs.should_build != 'true'
+        run: |
+          echo "Skip build because current repo is already at latest upstream release: ${{ steps.latest.outputs.tag }}"
+
+      - name: Checkout sing-box source
+        if: steps.current.outputs.should_build == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: SagerNet/sing-box
+          ref: ${{ steps.latest.outputs.tag }}
+          path: sing-box-src
+          fetch-depth: 0
+
+      - name: Setup Go
+        if: steps.current.outputs.should_build == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: sing-box-src/go.mod
+          cache: true
+          cache-dependency-path: sing-box-src/go.sum
+
+      - name: Prepare build tags and ldflags
+        if: steps.current.outputs.should_build == 'true'
+        id: meta
+        run: |
+          cd sing-box-src
+
+          default_tags=$(tr '\n' ',' < release/DEFAULT_BUILD_TAGS | sed 's/,$//')
+
+          # 1. 不再删除 with_naive_outbound，保留原汁原味的 default tags
+          final_tags=$(printf '%s\n' "$default_tags" | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd',' -)
+
+          # 2. 追加 v2ray api，以及解决 naive 免 CGO 编译问题的 with_purego
+          final_tags="${final_tags},with_v2ray_api,with_purego"
+
+          # 原项目 ldflags
+          base_ldflags=$(tr '\n' ' ' < release/LDFLAGS | sed 's/  */ /g')
+
+          # 显式写入版本号，避免 sing-box version 显示 unknown
+          final_ldflags="-X 'github.com/sagernet/sing-box/constant.Version=${{ steps.latest.outputs.version }}' ${base_ldflags}"
+
+          echo "tags=$final_tags" >> "$GITHUB_OUTPUT"
+          echo "ldflags=$final_ldflags" >> "$GITHUB_OUTPUT"
+
+          echo "Using tags: $final_tags"
+          echo "Using ldflags: $final_ldflags"
+
+      - name: Build linux amd64
+        if: steps.current.outputs.should_build == 'true'
+        run: |
+          cd sing-box-src
+          mkdir -p ../dist/linux-amd64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+          go build -trimpath \
+            -ldflags "${{ steps.meta.outputs.ldflags }}" \
+            -tags "${{ steps.meta.outputs.tags }}" \
+            -o ../dist/linux-amd64/sing-box \
+            ./cmd/sing-box
+
+      - name: Build linux arm64
+        if: steps.current.outputs.should_build == 'true'
+        run: |
+          cd sing-box-src
+          mkdir -p ../dist/linux-arm64
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+          go build -trimpath \
+            -ldflags "${{ steps.meta.outputs.ldflags }}" \
+            -tags "${{ steps.meta.outputs.tags }}" \
+            -o ../dist/linux-arm64/sing-box \
+            ./cmd/sing-box
+
+      - name: Verify amd64 build tags
+        if: steps.current.outputs.should_build == 'true'
+        run: |
+          chmod +x dist/linux-amd64/sing-box
+          dist/linux-amd64/sing-box version
+          dist/linux-amd64/sing-box version | grep "${{ steps.latest.outputs.version }}"
+          dist/linux-amd64/sing-box version | grep with_v2ray_api
+
+      - name: Verify all binaries exist
+        if: steps.current.outputs.should_build == 'true'
+        run: |
+          test -f dist/linux-amd64/sing-box
+          test -f dist/linux-arm64/sing-box
+
+      - name: Package tar.gz
+        if: steps.current.outputs.should_build == 'true'
+        run: |
+          mkdir -p release-files
+          tar -C dist/linux-amd64 -czf release-files/sing-box-linux-amd64.tar.gz sing-box
+          tar -C dist/linux-arm64 -czf release-files/sing-box-linux-arm64.tar.gz sing-box
+
+          cp dist/linux-amd64/sing-box release-files/sing-box-linux-amd64
+          cp dist/linux-arm64/sing-box release-files/sing-box-linux-arm64
+
+          sha256sum release-files/* > release-files/sha256sum.txt
+
+      - name: Delete existing tag release if needed
+        if: steps.current.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.latest.outputs.tag }}"
+          gh release delete "$tag" -R "${{ github.repository }}" -y --cleanup-tag || true
+
+      - name: Create release with gh
+        if: steps.current.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.latest.outputs.tag }}"
+          gh release create "$tag" \
+            release-files/sing-box-linux-amd64 \
+            release-files/sing-box-linux-arm64 \
+            release-files/sing-box-linux-amd64.tar.gz \
+            release-files/sing-box-linux-arm64.tar.gz \
+            release-files/sha256sum.txt \
+            --repo "${{ github.repository }}" \
+            --title "$tag" \
+            --notes "Auto-built sing-box with with_v2ray_api and with_naive_outbound"
+
+      # 保留历史 release/tag，供指定版本安装与故障回退。

@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# ============================================================
+# 模块: 01_utils.sh
+# 职责: 通用工具函数（无业务逻辑依赖）
+# ============================================================
+
+require_root() {
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    err "请使用 root 运行此脚本。"
+    exit 1
+  fi
+}
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+make_disk_tmp_dir() {
+  local prefix="${1:-sb-install}" base="/var/tmp" tmp_dir
+  mkdir -p "$base" 2>/dev/null || base="/tmp"
+  tmp_dir="$(mktemp -d "${base}/${prefix}.XXXXXX")" || return 1
+  echo "$tmp_dir"
+}
+
+random_b64_password() {
+  local bytes="${1:-16}" value
+  value="$(openssl rand -base64 "$bytes" 2>/dev/null || true)"
+  if [ -z "$value" ]; then
+    value="$(head -c "$bytes" /dev/urandom 2>/dev/null | openssl base64 -A 2>/dev/null || true)"
+  fi
+  [ -n "$value" ] && echo "$value"
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  if has_cmd timeout; then
+    timeout "$seconds" "$@"
+  else
+    "$@"
+  fi
+}
+
+download_file() {
+  local url="$1" output="$2" connect_timeout="${3:-20}" retry_count="${4:-3}"
+  if [ ! -t 1 ] || [ ! -t 2 ]; then
+    curl -fsSL --connect-timeout "$connect_timeout" --retry "$retry_count" "$url" -o "$output" >/dev/null 2>&1
+    return $?
+  fi
+
+  local total tmp_err curl_pid rc size tick=0
+  total="$(download_file_total_bytes "$url" "$connect_timeout")"
+  tmp_err="$(mktemp /tmp/sb-download-err.XXXXXX)" || return 1
+  rm -f "$output" >/dev/null 2>&1 || true
+
+  curl -fsSL --connect-timeout "$connect_timeout" --retry "$retry_count" "$url" -o "$output" 2>"$tmp_err" &
+  curl_pid=$!
+  while kill -0 "$curl_pid" 2>/dev/null; do
+    size="$(file_size_bytes "$output")"
+    print_download_progress "$size" "$total" "$tick"
+    tick=$((tick + 1))
+    sleep 1
+  done
+
+  if wait "$curl_pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  clear_download_progress
+  if [ "$rc" -ne 0 ] && [ -s "$tmp_err" ]; then
+    sed 's/^/  /' "$tmp_err" >&2
+  fi
+  rm -f "$tmp_err" >/dev/null 2>&1 || true
+  return "$rc"
+}
+
+download_file_total_bytes() {
+  local url="$1" connect_timeout="${2:-20}" total
+  [ "$connect_timeout" -gt 5 ] && connect_timeout=5
+  total="$(curl -fsSIL --connect-timeout "$connect_timeout" --max-time 10 "$url" 2>/dev/null \
+    | awk 'tolower($1) == "content-length:" {gsub(/\r/,"",$2); n=$2} END {if (n ~ /^[0-9]+$/) print n}')" || true
+  echo "${total:-0}"
+}
+
+file_size_bytes() {
+  local file="$1" size
+  [ -f "$file" ] || { echo 0; return 0; }
+  size="$(stat -c '%s' "$file" 2>/dev/null || wc -c < "$file" 2>/dev/null || echo 0)"
+  size="${size//[[:space:]]/}"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  echo "$size"
+}
+
+format_download_bytes() {
+  local bytes="${1:-0}"
+  awk -v b="$bytes" 'BEGIN {
+    if (b >= 1073741824) printf "%.1fG", b / 1073741824;
+    else if (b >= 1048576) printf "%.1fM", b / 1048576;
+    else if (b >= 1024) printf "%.1fK", b / 1024;
+    else printf "%dB", b;
+  }'
+}
+
+print_download_progress() {
+  local size="${1:-0}" total="${2:-0}" tick="${3:-0}" width=24
+  local percent filled bar spin
+  if [[ "$total" =~ ^[0-9]+$ ]] && [ "$total" -gt 0 ]; then
+    percent=$((size * 100 / total))
+    [ "$percent" -gt 100 ] && percent=100
+    filled=$((percent * width / 100))
+    bar="$(printf '%*s' "$filled" '' | tr ' ' '=')"
+    if [ "$filled" -lt "$width" ]; then
+      bar="${bar}>$(printf '%*s' $((width - filled - 1)) '')"
+    fi
+    printf '\r下载中 [%-*s] %3d%% %s/%s' "$width" "$bar" "$percent" "$(format_download_bytes "$size")" "$(format_download_bytes "$total")"
+  else
+    case $((tick % 4)) in
+      0) spin="|" ;;
+      1) spin="/" ;;
+      2) spin="-" ;;
+      *) spin="\\" ;;
+    esac
+    printf '\r下载中 [%s] %s' "$spin" "$(format_download_bytes "$size")"
+  fi
+}
+
+clear_download_progress() {
+  local cols="${COLUMNS:-80}"
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  printf '\r%*s\r' "$cols" ''
+}
+
+now_ms() {
+  local value
+  value="$(date +%s%3N 2>/dev/null || true)"
+  if [[ "$value" =~ ^[0-9]{13,}$ ]]; then
+    echo "$value"
+    return 0
+  fi
+  value="$(date +%s 2>/dev/null || true)"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo $((value * 1000))
+  else
+    echo 0
+  fi
+}
+
+# ---------- 包管理器 / init 系统检测 ----------
+
+detect_pkg_manager() {
+  if has_cmd apt-get; then echo "apt"
+  elif has_cmd apk;   then echo "apk"
+  else                     echo "unknown"
+  fi
+}
+PKG_MANAGER="$(detect_pkg_manager)"
+
+detect_init_system() {
+  if has_cmd systemctl && systemctl --version >/dev/null 2>&1; then echo "systemd"
+  elif has_cmd rc-service; then echo "openrc"
+  else                          echo "unknown"
+  fi
+}
+INIT_SYSTEM="$(detect_init_system)"
+
+# ---------- 包管理抽象 ----------
+
+pkg_installed() {
+  case "$PKG_MANAGER" in
+    apt) [ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null || true)" = "installed" ] ;;
+    apk) apk info -e "$1" >/dev/null 2>&1 ;;
+    *)   return 1 ;;
+  esac
+}
+
+pkg_update_once() {
+  local stamp="/tmp/.sb_pkg_updated"
+  [ -f "$stamp" ] && return 0
+  case "$PKG_MANAGER" in
+    apt)
+      [ "${_PKG_INSTALL_QUIET:-0}" = "1" ] || say "更新包索引..."
+      if [ "${_PKG_INSTALL_QUIET:-0}" = "1" ]; then
+        apt-get update -y >/dev/null 2>&1
+      else
+        apt-get update -y
+      fi
+      ;;
+    apk)
+      [ "${_PKG_INSTALL_QUIET:-0}" = "1" ] || say "更新包索引..."
+      if [ "${_PKG_INSTALL_QUIET:-0}" = "1" ]; then
+        apk update -q >/dev/null 2>&1
+      else
+        apk update -q
+      fi
+      ;;
+  esac
+  touch "$stamp"
+}
+
+install_pkg() {
+  local pkg="$1"
+  pkg_installed "$pkg" && return 0
+  pkg_update_once
+  [ "${_PKG_INSTALL_QUIET:-0}" = "1" ] || say "安装依赖: $pkg"
+  case "$PKG_MANAGER" in
+    apt)
+      if [ "${_PKG_INSTALL_QUIET:-0}" = "1" ]; then
+        apt-get install -y "$pkg" >/dev/null 2>&1 || { err "依赖安装失败：$pkg"; return 1; }
+      else
+        apt-get install -y "$pkg"
+      fi
+      ;;
+    apk)
+      if [ "${_PKG_INSTALL_QUIET:-0}" = "1" ]; then
+        apk add -q "$pkg" >/dev/null 2>&1 || { err "依赖安装失败：$pkg"; return 1; }
+      else
+        apk add -q "$pkg"
+      fi
+      ;;
+    *)   err "不支持的包管理器，请手动安装: $pkg"; return 1 ;;
+  esac
+}
+
+# 保留旧名以避免遗漏调用
+install_pkg_apt() { install_pkg "$@"; }
+apt_update_once()  { pkg_update_once; }
+
+# ---------- 服务检测 ----------
+
+singbox_service_active() {
+  case "$INIT_SYSTEM" in
+    systemd) has_cmd systemctl && systemctl is-active --quiet sing-box 2>/dev/null ;;
+    openrc)  rc-service sing-box status >/dev/null 2>&1 ;;
+    *)       return 1 ;;
+  esac
+}
+
+generate_random_alpha_path() {
+  local s
+  s="$(openssl rand -base64 32 2>/dev/null | tr -dc 'A-Za-z' | head -c 7 || true)"
+  [ ${#s} -ge 7 ] || s="$(head -c 32 /dev/urandom 2>/dev/null | tr -dc 'A-Za-z' | head -c 7 || echo "xBqLmRt")"
+  echo "/${s:0:7}"
+}
+
+normalize_ws_path() {
+  local p="${1:-}"
+  if [ -z "$p" ]; then
+    generate_random_alpha_path
+    return 0
+  fi
+  [[ "$p" != /* ]] && p="/$p"
+  echo "$p"
+}
+
+get_public_ip() {
+  if [ -n "${_CACHED_PUBLIC_IP:-}" ]; then
+    echo "$_CACHED_PUBLIC_IP"
+    return 0
+  fi
+  local ip=""
+  ip=$(curl -s4 --max-time 3 --connect-timeout 2 ifconfig.me 2>/dev/null || true)
+  [ -z "$ip" ] && ip=$(curl -s4 --max-time 3 --connect-timeout 2 api.ipify.org 2>/dev/null || true)
+  [ -z "$ip" ] && ip=$(curl -s4 --max-time 3 --connect-timeout 2 icanhazip.com 2>/dev/null | tr -d '\n' || true)
+  [ -z "$ip" ] && ip="IP"
+  _CACHED_PUBLIC_IP="$ip"
+  echo "$ip"
+}
+
+local_warp_socks_proxy_url() {
+  local proxy_file="/etc/wireguard/proxy.conf"
+  local port
+  [ -s "$proxy_file" ] || return 1
+  port="$(awk -F: '/^[[:space:]]*BindAddress[[:space:]]*=/{gsub(/[[:space:]]/,"",$NF); print $NF; exit}' "$proxy_file" 2>/dev/null || true)"
+  [ -n "$port" ] || port="40000"
+  has_cmd ss || return 1
+  ss -nltp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {found=1} END {exit !found}' || return 1
+  echo "socks5h://127.0.0.1:${port}"
+}
+
+curl_maybe_warp() {
+  local proxy tmp_file
+  proxy="$(local_warp_socks_proxy_url 2>/dev/null || true)"
+  if [ -n "$proxy" ]; then
+    tmp_file="$(mktemp /tmp/sb-curl-warp.XXXXXX)" || {
+      curl --proxy "$proxy" "$@" || curl "$@"
+      return $?
+    }
+    if curl --proxy "$proxy" "$@" > "$tmp_file"; then
+      cat "$tmp_file"
+      rm -f "$tmp_file" >/dev/null 2>&1 || true
+      return 0
+    fi
+    rm -f "$tmp_file" >/dev/null 2>&1 || true
+    curl "$@"
+  else
+    curl "$@"
+  fi
+}
+
+parse_plus_selections() {
+  local s="$1"
+  local -A seen=()
+  local out=()
+  local x
+  IFS='+' read -ra parts <<< "$s"
+  for x in "${parts[@]}"; do
+    x="$(echo "$x" | tr -d ' ')"
+    [ -z "$x" ] && continue
+    if [ -z "${seen[$x]:-}" ]; then
+      out+=("$x")
+      seen[$x]=1
+    fi
+  done
+  printf "%s\n" "${out[@]}"
+}
+
+ask_confirm_yes() {
+  local prompt="${1:-输入 YES 确认继续，其它任意输入取消: }"
+  local ans
+  read -r -p "$prompt" ans
+  [ "$ans" = "YES" ]
+}
+
+ask_confirm_yn() {
+  local prompt="${1:-确认继续吗？(y/N): }"
+  local ans
+  printf '%s' "$prompt" >&2
+  read -r ans || ans=""
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+is_valid_ymd_date() {
+  local value="${1:-}"
+  [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+  awk -v value="$value" '
+    function leap(y) { return (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) }
+    function dim(y, m) {
+      if (m == 2) return leap(y) ? 29 : 28
+      if (m == 4 || m == 6 || m == 9 || m == 11) return 30
+      return 31
+    }
+    BEGIN {
+      split(value, a, "-")
+      y = a[1] + 0; m = a[2] + 0; d = a[3] + 0
+      if (y < 1 || m < 1 || m > 12 || d < 1 || d > dim(y, m)) exit 1
+    }
+  '
+}
+
+is_valid_port() {
+  local v="$1"
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  [ "$v" -ge 1 ] && [ "$v" -le 65535 ]
+}
+
+ask_port_or_return() {
+  local prompt="$1" default="$2" outvar="$3"
+  local val __retry
+  while true; do
+    read -r -p "$prompt" val
+    if [ -z "$val" ]; then
+      val="$default"
+    fi
+    if is_valid_port "$val"; then
+      printf -v "$outvar" '%s' "$val"
+      return 0
+    fi
+    warn "端口输入无效：${val}。请输入 1-65535 的数字，回车使用默认值 ${default}。"
+    read -r -p "输入 1 重新填写，其它任意键返回上一级: " __retry
+    [ "${__retry:-}" = "1" ] || return 1
+  done
+}
+
+json_is_object() {
+  local s="${1:-}"
+  [ -n "$s" ] && echo "$s" | jq -e 'type=="object"' >/dev/null 2>&1
+}
+
+format_traffic_auto() {
+  local bytes="${1:-0}"
+  awk -v b="$bytes" 'BEGIN {
+    if (b < 1024*1024*1024) printf("%.1f MB", b/1024/1024);
+    else if (b < 1024*1024*1024*1024) printf("%.1f GB", b/1024/1024/1024);
+    else printf("%.1f TB", b/1024/1024/1024/1024);
+  }'
+}
+
+format_bytes_human() { format_traffic_auto "$@"; }
+
+reset_day_text() {
+  case "${1:-0}" in
+    0|"") echo "不重置" ;;
+    32) echo "月底" ;;
+    *) echo "${1}号" ;;
+  esac
+}
+
+expire_text() {
+  local v="${1:-}"
+  [ -n "$v" ] && [ "$v" != "0" ] && echo "$v" || echo "永久"
+}
+
+parse_traffic_to_bytes() {
+  local raw="${1:-}" normalized num unit sign=1
+  normalized="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+  if [[ "$normalized" == -* ]]; then
+    sign=-1
+    normalized="${normalized#-}"
+  fi
+  if [[ ! "$normalized" =~ ^([0-9]+(\.[0-9])?)(mb|gb|tb)$ ]]; then
+    return 1
+  fi
+  num="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[3]}"
+  awk -v n="$num" -v u="$unit" -v s="$sign" 'BEGIN {
+    if (u == "mb") printf "%.0f", s * n * 1048576;
+    else if (u == "gb") printf "%.0f", s * n * 1073741824;
+    else if (u == "tb") printf "%.0f", s * n * 1099511627776;
+    else exit 1;
+  }'
+}
+
+is_valid_user_name() {
+  local u="${1:-}"
+  [[ -n "$u" ]] || return 1
+  [[ "$u" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ "$u" != *"@"* ]] || return 1
+  [[ "$u" != *"/"* ]] || return 1
+  [[ "$u" != *":"* ]] || return 1
+  [[ "$u" != *" "* ]] || return 1
+}
+
+user_node_part() {
+  local name="${1:-}"
+  if [[ "$name" == *"@"* ]]; then
+    echo "${name%%@*}"
+  else
+    echo "$name"
+  fi
+}
+
+user_business_name() {
+  local name="${1:-}"
+  if [[ "$name" == *"@"* ]]; then
+    echo "${name#*@}"
+  else
+    echo "admin"
+  fi
+}
+
+node_user_name() {
+  local node_key="$1" username="$2"
+  if [ "$username" = "admin" ]; then
+    echo "$node_key"
+  else
+    echo "${node_key}@${username}"
+  fi
+}
