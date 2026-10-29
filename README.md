@@ -1,18 +1,34 @@
-# Sing-box 多用户与管理脚本
+# Sing-box 多用户与管理脚本（6.1.9-lowmem）
 
 这是一个基于原版 Sing-box 逻辑的一键管理脚本，专为多用户管理场景设计，自编译版本支持 v2ray_api 流量统计。
 
-**交流与反馈**：https://t.me/sb_gogogo
+**本分支**：在 v6.1.9 基础上适配 **128MB 内存**的小型 VPS，移除 Telegram Bot 模块，保留全部多用户管理、协议、路由、中转、WARP 与导出功能。详见下文「6.1.9-lowmem」一节。
+
+**仓库**：https://github.com/CanYanQwQ/singbox-panel
 
 ## 快速开始
 
+**root 用户一键安装：**
+
 ```bash
-wget -O sb.sh https://raw.githubusercontent.com/Tangfffyx/sing-box/main/sb.sh && bash sb.sh
+curl -fsSL https://raw.githubusercontent.com/CanYanQwQ/singbox-panel/main/sb.sh -o /root/sb.sh && bash /root/sb.sh
 ```
-**非root用户：**
+
+**非 root 用户：**
+
 ```bash
-wget -O sb.sh https://raw.githubusercontent.com/Tangfffyx/sing-box/main/sb.sh && sudo bash sb.sh
+curl -fsSL https://raw.githubusercontent.com/CanYanQwQ/singbox-panel/main/sb.sh -o sb.sh && sudo bash sb.sh
 ```
+
+**国内加速（raw 被墙或很慢时用这个）：**
+
+```bash
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/CanYanQwQ/singbox-panel/main/sb.sh -o /root/sb.sh && bash /root/sb.sh
+```
+
+> **必须下载成文件再执行，不要用 `bash <(curl ...)` 或 `curl ... | bash`。**
+> 脚本需要读取自身来安装快捷命令 `s`（见 `lib/80_installer.sh` 的 `resolve_current_script_file`）。管道方式下 `$0` 是 `/dev/fd/63` 指向的匿名管道，读完就没了，脚本无法复制自身，会导致快捷命令安装失败。
+> 如果系统没有 curl，把 `curl -fsSL <url> -o 文件` 换成 `wget -qO 文件 <url>` 即可。
 
 * **快捷命令**：安装完成后，在终端输入 `s` 即可唤出管理菜单。
 * **避免冲突**：如果当前系统已安装官方版本的 sing-box，推荐先在菜单中执行“8. 卸载 sing-box”（保留数据），再执行“1. 安装/更新 sing-box”进行环境接管。
