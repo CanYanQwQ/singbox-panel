@@ -4060,47 +4060,167 @@ _cron_job_installed() {
   '
 }
 
-_crond_daemon_active() {
+# cron 守护进程在不同发行版里的服务名并不统一，必须逐个探测：
+#   Debian/Ubuntu   -> cron
+#   RHEL/CentOS     -> crond
+#   Alpine + cronie -> crond
+#   Alpine + dcron  -> dcron      <- 旧代码只试 crond/cron，装到 dcron 就永远起不来
+# 极简镜像 / 容器镜像还可能根本没有 init 服务脚本，只有 busybox 的 crond applet。
+_CROND_SERVICE_CANDIDATES="crond cron dcron cronie"
+
+_crond_service_exists() {
+  local svc="$1"
   case "$INIT_SYSTEM" in
     systemd)
-      systemctl is-active --quiet crond 2>/dev/null || systemctl is-active --quiet cron 2>/dev/null
+      [ -e "/etc/systemd/system/${svc}.service" ] ||
+      [ -e "/lib/systemd/system/${svc}.service" ] ||
+      [ -e "/usr/lib/systemd/system/${svc}.service" ]
       ;;
-    openrc)
-      rc-service crond status >/dev/null 2>&1 || rc-service cron status >/dev/null 2>&1
+    *)
+      # openrc，以及"init 未识别但仍有 /etc/init.d 脚本"的极简发行版
+      [ -e "/etc/init.d/${svc}" ]
       ;;
-    *) return 1 ;;
   esac
 }
 
-_ensure_crond_running() {
-  # 1. 确保 crontab 命令可用，不可用时按包管理器装对应包
-  if ! has_cmd crontab; then
-    case "$PKG_MANAGER" in
-      apt) install_pkg cron 2>/dev/null || install_pkg cronie 2>/dev/null || return 1 ;;
-      apk) install_pkg cronie 2>/dev/null || install_pkg dcron 2>/dev/null || return 1 ;;
-      *) return 1 ;;
+# 没有 init 服务脚本时，用 pidfile 判断守护进程是否还活着。
+_crond_pidfile_alive() {
+  local f pid
+  for f in /run/crond.pid /var/run/crond.pid /run/cron.pid /var/run/cron.pid; do
+    [ -r "$f" ] || continue
+    pid="$(cat "$f" 2>/dev/null)"
+    [ -n "$pid" ] || continue
+    kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# busybox 的 crond 不写 pidfile，极简镜像也可能没有 init 服务脚本，
+# 最后的手段是扫进程表。优先读 /proc/<pid>/comm（精确的进程名，不受 ps
+# 参数差异与命令行参数里出现 "cron" 字样的干扰），没有 /proc 才退回 ps。
+_crond_process_alive() {
+  local d comm args out probe
+
+  # ① Linux 正规路径：/proc 存在就只用 /proc，判完即返回，不再退回 ps。
+  #    若 /proc 里所有 comm 都读不到（hidepid=2、受限容器），probe 仍为 0，
+  #    会继续走 ② 的 ps 分支，避免"看不见就断言没在跑"。
+  probe=0
+  for d in /proc/[0-9]*; do
+    [ -d "$d" ] || continue
+    [ -r "$d/comm" ] || continue
+    comm="$(cat "$d/comm" 2>/dev/null)" || continue
+    [ -n "$comm" ] || continue
+    probe=1
+    case "$comm" in
+      crond|cron|cronie|dcron) return 0 ;;
     esac
-  fi
+  done
+  [ "$probe" = "1" ] && return 1
 
-  # 2. 已运行直接通过
-  _crond_daemon_active && return 0
+  # ② 没有 /proc（个别容器 / 非 Linux）：退回 ps，参数逐个尝试。
+  for args in "-ef" "aux" "-A" ""; do
+    # shellcheck disable=SC2086
+    out="$(ps $args 2>/dev/null)" || continue
+    [ -n "$out" ] || continue
+    printf '%s\n' "$out" | awk '
+      {
+        for (i = 1; i <= NF; i++) {
+          name = $i
+          sub(/^.*\//, "", name)
+          sub(/^\[/, "", name)
+          if (name == "crond" || name == "cron" || name == "dcron") { found = 1 }
+        }
+      }
+      END { exit !found }
+    ' && return 0
+  done
+  return 1
+}
 
-  # 3. 启动 daemon（systemd / openrc 兼容 crond 和 cron 两种服务名）
+_crond_daemon_active() {
+  local svc
+  for svc in $_CROND_SERVICE_CANDIDATES; do
+    case "$INIT_SYSTEM" in
+      systemd) systemctl is-active --quiet "$svc" 2>/dev/null && return 0 ;;
+      openrc)  rc-service "$svc" status >/dev/null 2>&1 && return 0 ;;
+    esac
+  done
+  _crond_pidfile_alive && return 0
+  _crond_process_alive && return 0
+  return 1
+}
+
+_crond_start_and_enable() {
+  local svc="$1"
   case "$INIT_SYSTEM" in
     systemd)
-      systemctl start crond >/dev/null 2>&1 || systemctl start cron >/dev/null 2>&1 || true
-      systemctl enable crond >/dev/null 2>&1 || systemctl enable cron >/dev/null 2>&1 || true
+      systemctl start "$svc" >/dev/null 2>&1 || return 1
+      systemctl enable "$svc" >/dev/null 2>&1 || true
       ;;
     openrc)
-      rc-service crond start >/dev/null 2>&1 || rc-service cron start >/dev/null 2>&1 || true
-      rc-update add crond default >/dev/null 2>&1 || rc-update add cron default >/dev/null 2>&1 || true
+      rc-service "$svc" start >/dev/null 2>&1 || return 1
+      rc-update add "$svc" default >/dev/null 2>&1 || true
       ;;
-    *) return 1 ;;
+    *)
+      return 1
+      ;;
   esac
+  return 0
+}
 
-  # 4. 等待 daemon 稳定后再次验证
-  sleep 1
-  _crond_daemon_active
+# 兜底：没有 init 脚本的极简镜像，直接把 crond 放到后台当守护进程跑起来。
+# 注意不能只看命令名——busybox 的 crond 参数与 cronie 不同，用最保守的 `-b`。
+_crond_spawn_fallback() {
+  local bin
+  for bin in crond cron; do
+    has_cmd "$bin" || continue
+    # busybox/cronie 的 crond 都接受 -b（后台），失败再退回裸启动。
+    ( "$bin" -b >/dev/null 2>&1 & ) || true
+    sleep 1
+    _crond_daemon_active && return 0
+    ( "$bin" >/dev/null 2>&1 & ) || true
+    sleep 1
+    _crond_daemon_active && return 0
+  done
+  return 1
+}
+
+_ensure_crond_running() {
+  local svc
+
+  # 1. 已经在跑就直接通过
+  _crond_daemon_active && return 0
+
+  # 2. 机器上已有 init 服务脚本：直接启动并设为开机自启
+  for svc in $_CROND_SERVICE_CANDIDATES; do
+    if _crond_service_exists "$svc"; then
+      _crond_start_and_enable "$svc" || true
+      _crond_daemon_active && return 0
+    fi
+  done
+
+  # 3. 没有可用的服务脚本，按包管理器补装一个自带 init 脚本的实现。
+  #    注意：不能只看 crontab 命令在不在——busybox 自带 crontab applet，
+  #    命令存在但守护进程没有，这正是 Alpine / 极简系统的坑。
+  case "$PKG_MANAGER" in
+    apt) install_pkg cron >/dev/null 2>&1 || install_pkg cronie >/dev/null 2>&1 || true ;;
+    apk) install_pkg cronie >/dev/null 2>&1 || install_pkg dcron >/dev/null 2>&1 || true ;;
+    *)   : ;;
+  esac
+  for svc in $_CROND_SERVICE_CANDIDATES; do
+    if _crond_service_exists "$svc"; then
+      _crond_start_and_enable "$svc" || true
+      _crond_daemon_active && return 0
+    fi
+  done
+
+  # 4. 兜底：直接起进程（无 init 脚本的极简 / 容器镜像）
+  if _crond_spawn_fallback; then
+    warn "系统没有可用的 cron 服务脚本，已直接启动 crond 后台进程；重启后需重新执行安装以恢复定时任务。"
+    return 0
+  fi
+
+  return 1
 }
 
 cron_job_status_line() {
@@ -4122,7 +4242,16 @@ cron_job_status_line() {
 _install_cron_job() {
   local mark="$1" schedule="$2" cmd="$3"
   # 先让 _ensure_crond_running 负责装 cron 包 + 启动 daemon
-  _ensure_crond_running || { err "cron 服务不可用（未能自动安装或启动 crond）。"; return 1; }
+  if ! _ensure_crond_running; then
+    if ! has_cmd crontab; then
+      err "cron 服务不可用：系统缺少 crontab 命令（包管理器: ${PKG_MANAGER}）。"
+      err "  请手动安装 cron 后重试，例如：apk add cronie   或   apt-get install -y cron"
+    else
+      err "cron 服务不可用：crontab 命令存在，但 cron 守护进程起不来（init: ${INIT_SYSTEM}）。"
+      err "  请手动启动后重试，例如：rc-service crond start && rc-update add crond default"
+    fi
+    return 1
+  fi
   # 到这里 crontab 命令必然可用（_ensure_crond_running 会主动安装）
   local tmp pattern
   pattern="$(_cron_job_match_pattern "$mark")"
