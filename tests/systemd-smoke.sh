@@ -3,7 +3,7 @@
 set -euo pipefail
 [[ "${1:-}" == --allow-systemd ]] || { echo 'Requires --allow-systemd on a disposable Linux test host'; exit 2; }
 cd "$(dirname "$0")/.."
-for module in 00_base 01_utils 10_config 20_protocol 30_route 40_relay 50_v2ray_api 60_user_db 61_user_manager 80_installer; do source "lib/$module.sh"; done
+for module in 00_base 01_utils 10_config 20_protocol 30_route 50_v2ray_api 60_user_db 61_user_manager 80_installer; do source "lib/$module.sh"; done
 TEST=$(mktemp -d /var/tmp/sb-systemd.XXXXXX)
 unit="sb-validation-$$"
 cleanup() {

@@ -14,7 +14,8 @@ protocol_status_summary() {
 
   for proto in "${SUPPORTED_PROTOCOLS[@]}"; do
     label="$proto"
-    ports="$(printf '%s\n' "$all_lines" | awk -F '\x01' -v p="$proto" 'NF >= 3 && $2 == p { print $3 }' | sort -n | uniq | paste -sd'|' -)"
+    # \001 八进制而非 \x01：busybox awk（Alpine 默认）不认 \xHH 转义。
+    ports="$(printf '%s\n' "$all_lines" | awk -F '\001' -v p="$proto" 'NF >= 3 && $2 == p { print $3 }' | sort -n | uniq | paste -sd'|' -)"
 
     if [ -n "$ports" ]; then
       printf '%s\t%s\t%s\n' "$label" "已安装" "$ports"
@@ -37,7 +38,7 @@ normalize_takeover(){
   local json work_json
   local -a inv_lines=() issue_lines=() action_lines=()
   local -A target_seen=()
-  local tag_updates=0 direct_updates=0 relay_user_updates=0 relay_out_updates=0 skipped=0
+  local tag_updates=0 direct_updates=0 skipped=0
 
   json="$(config_load)"
   work_json="$json"
@@ -85,22 +86,14 @@ normalize_takeover(){
       tag_updates=$((tag_updates+1))
     fi
 
-    local -a user_lines=() relay_names=() direct_candidates=()
-    local user_line uidx uname relay_user out_tag land new_user new_out direct_old
+    local -a user_lines=() direct_candidates=()
+    local user_line uidx uname direct_old
 
     mapfile -t user_lines < <(echo "$work_json" | jq -r --argjson idx "$idx" '.inbounds[$idx].users // [] | to_entries[] | [.key, (.value.name // .value.username // "")] | join("\u0001")')
-    mapfile -t relay_names < <(relay_list_table "$work_json" | awk -F '\x01' -v ek="$target" '$1 == ek {print $2}')
 
     for user_line in "${user_lines[@]}"; do
       IFS=$'\x01' read -r uidx uname <<< "$user_line"
-      local is_relay=0 rn
-      for rn in "${relay_names[@]}"; do
-        if [ "$uname" = "$rn" ] && [ -n "$uname" ]; then
-          is_relay=1
-          break
-        fi
-      done
-      if [ "$proto" != "socks" ] && [ $is_relay -eq 0 ] && [[ "$uname" != *"@"* ]]; then
+      if [ "$proto" != "socks" ] && [[ "$uname" != *"@"* ]] && [[ "$uname" != *"-to-"* ]]; then
         direct_candidates+=("$uidx:$uname")
       fi
     done
@@ -137,80 +130,12 @@ normalize_takeover(){
       skipped=$((skipped+1))
     fi
 
-    while IFS=$'\x01' read -r _ relay_user out_tag; do
-      [ -z "${relay_user:-}" ] && continue
-      [[ "$relay_user" == *"@"* ]] && continue
-      land=""
-      if [[ "$out_tag" =~ ^out-.*-to-(.+)$ ]]; then
-        land="${BASH_REMATCH[1]}"
-      elif [[ "$out_tag" =~ ^out-to-(.+)$ ]]; then
-        land="${BASH_REMATCH[1]}"
-      elif [[ "$out_tag" =~ ^to-(.+)$ ]]; then
-        land="${BASH_REMATCH[1]}"
-      elif [[ "$relay_user" =~ -to-(.+)$ ]]; then
-        land="${BASH_REMATCH[1]}"
-      fi
-
-      if [ -z "$land" ] || [ -z "$out_tag" ]; then
-        issue_lines+=("中转关系不完整，未自动接管：${relay_user:-<空>} -> ${out_tag:-<空>}")
-        skipped=$((skipped+1))
-        continue
-      fi
-
-      new_user="$(relay_user_name "$target" "$land")"
-      new_out="$(relay_outbound_tag "$target" "$land")"
-
-      if [ "$relay_user" != "$new_user" ]; then
-        work_json="$(echo "$work_json" | jq --argjson idx "$idx" --arg old "$relay_user" --arg new "$new_user" '
-          (.inbounds[$idx].users // []) |= map(
-            if (.name // "") == $old then .name = $new
-            elif (.username // "") == $old then .username = $new
-            else . end
-          )
-          | .route.rules |= map(
-              if (.auth_user? != null) then
-                .auth_user |= (
-                  if type == "array" then map(if . == $old then $new else . end)
-                  elif . == $old then $new
-                  else . end
-                )
-              else . end
-            )
-        ')" || {
-          err "规范化中转用户失败：$relay_user"
-          pause
-          return 1
-        }
-        action_lines+=("中转用户：${relay_user} -> ${new_user}")
-        relay_user_updates=$((relay_user_updates+1))
-      fi
-
-      if [ "$out_tag" != "$new_out" ]; then
-        if echo "$work_json" | jq -e --arg o "$new_out" --arg old "$out_tag" '.outbounds[]? | select((.tag // "") == $new_out and (.tag // "") != $old)' >/dev/null 2>&1; then
-          issue_lines+=("目标 outbound tag 已存在，未自动规范化：${out_tag} -> ${new_out}")
-          skipped=$((skipped+1))
-        else
-          work_json="$(echo "$work_json" | jq --arg old "$out_tag" --arg new "$new_out" '
-            .outbounds |= map(if (.tag // "") == $old then .tag = $new else . end)
-            | .route.rules |= map(if (.outbound // "") == $old then .outbound = $new else . end)
-          ')" || {
-            err "规范化中转 outbound 失败：$out_tag"
-            pause
-            return 1
-          }
-          action_lines+=("中转 outbound：${out_tag} -> ${new_out}")
-          relay_out_updates=$((relay_out_updates+1))
-        fi
-      fi
-    done < <(relay_list_table "$work_json" | awk -F '\x01' -v ek="$target" '$1 == ek {print $1"\001"$2"\001"$3}')
   done
 
   echo -e "${B}--------------------------------------------------------${NC}"
   echo -e "${C}预览结果${NC}"
   echo -e "  主入站规范化：${tag_updates}"
   echo -e "  直连用户规范化：${direct_updates}"
-  echo -e "  中转用户规范化：${relay_user_updates}"
-  echo -e "  中转 outbound 规范化：${relay_out_updates}"
   if [ ${#action_lines[@]} -gt 0 ]; then
     echo -e "${B}--------------------------------------------------------${NC}"
     echo -e "${C}计划执行${NC}"
@@ -228,7 +153,7 @@ normalize_takeover(){
     done
   fi
 
-  if [ $tag_updates -eq 0 ] && [ $direct_updates -eq 0 ] && [ $relay_user_updates -eq 0 ] && [ $relay_out_updates -eq 0 ]; then
+  if [ $tag_updates -eq 0 ] && [ $direct_updates -eq 0 ]; then
     warn "没有可自动规范化的对象。"
     pause
     return 0
@@ -573,20 +498,6 @@ protocol_remove_menu() {
   local _cert_files_to_clean=()
   for c in "${choice_arr[@]}"; do
     IFS=$'\x01' read -r entry_key _ <<< "${lines[$((c-1))]}"
-    related="$(relay_list_table "$updated_json" | awk -F '\x01' -v ek="$entry_key" '{u=$2; sub(/@.*/, "", u)} $1 == ek {print u}' | awk 'NF' | sort -u)" || {
-      err "读取关联中转失败，已中止卸载。"
-      pause
-      return 1
-    }
-    if [ -n "$related" ]; then
-      warn "卸载 ${entry_key} 将同时删除以下关联中转："
-      echo "$related" | sed 's/^/  - /'
-    fi
-    updated_json="$(remove_relays_for_entry_key "$updated_json" "$entry_key")" || {
-      err "删除关联中转失败，已中止，未写入配置。"
-      pause
-      return 1
-    }
     local _crt _key
     _crt="$(echo "$updated_json" | jq -r --arg ek "$entry_key" '.inbounds[]? | select((.tag // "") == $ek) | .tls.certificate_path // empty' | head -n1)"
     _key="$(echo "$updated_json" | jq -r --arg ek "$entry_key" '.inbounds[]? | select((.tag // "") == $ek) | .tls.key_path // empty' | head -n1)"
@@ -686,7 +597,8 @@ clear_config_json() {
   echo -e "${Y}--- 清空/重置配置文件 ---${NC}"
   echo -e "${Y}注意：该操作将清空当前 config.json。${NC}"
   ask_confirm_yes || { warn "已取消清空/重置。"; pause; return 0; }
-  # 原子提交：config 重置 + meta 删 .warp/.relay 在同一把锁内一起做，避免分裂
+  # 原子提交：config 重置 + meta 清理在同一把锁内一起做，避免分裂。
+  # del(.warp, .relay) 用于清理旧版本遗留的分流状态；本版本已无这两个功能。
   local empty_config empty_meta
   empty_config="$(config_min_template)"
   empty_meta="$(meta_load 2>/dev/null | jq 'del(.warp, .relay)' 2>/dev/null)"

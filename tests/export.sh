@@ -2,7 +2,7 @@
 set -euo pipefail
 [ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo 'SKIP export fixtures (Bash 4+ in Linux CI)'; exit 0; }
 cd "$(dirname "$0")/.."
-for module in 00_base 01_utils 10_config 20_protocol 30_route 40_relay 50_v2ray_api 70_export; do source "lib/$module.sh"; done
+for module in 00_base 01_utils 10_config 20_protocol 30_route 50_v2ray_api 70_export; do source "lib/$module.sh"; done
 init_manager_env() { :; }; pause() { :; }; clear() { :; }
 export_collect_context() { echo '{"ip":"127.0.0.1","ws_domain":"example.com","vm_domain":"example.com"}'; }
 key=MDEyMzQ1Njc4OWFiY2RlZg==

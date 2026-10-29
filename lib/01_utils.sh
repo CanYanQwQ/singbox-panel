@@ -266,37 +266,6 @@ get_public_ip() {
   echo "$ip"
 }
 
-local_warp_socks_proxy_url() {
-  local proxy_file="/etc/wireguard/proxy.conf"
-  local port
-  [ -s "$proxy_file" ] || return 1
-  port="$(awk -F: '/^[[:space:]]*BindAddress[[:space:]]*=/{gsub(/[[:space:]]/,"",$NF); print $NF; exit}' "$proxy_file" 2>/dev/null || true)"
-  [ -n "$port" ] || port="40000"
-  has_cmd ss || return 1
-  ss -nltp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {found=1} END {exit !found}' || return 1
-  echo "socks5h://127.0.0.1:${port}"
-}
-
-curl_maybe_warp() {
-  local proxy tmp_file
-  proxy="$(local_warp_socks_proxy_url 2>/dev/null || true)"
-  if [ -n "$proxy" ]; then
-    tmp_file="$(mktemp /tmp/sb-curl-warp.XXXXXX)" || {
-      curl --proxy "$proxy" "$@" || curl "$@"
-      return $?
-    }
-    if curl --proxy "$proxy" "$@" > "$tmp_file"; then
-      cat "$tmp_file"
-      rm -f "$tmp_file" >/dev/null 2>&1 || true
-      return 0
-    fi
-    rm -f "$tmp_file" >/dev/null 2>&1 || true
-    curl "$@"
-  else
-    curl "$@"
-  fi
-}
-
 parse_plus_selections() {
   local s="$1"
   local -A seen=()

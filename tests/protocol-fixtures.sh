@@ -2,7 +2,7 @@
 # Generates isolated fixtures using the production builders; never touches /etc.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-for module in 00_base 01_utils 10_config 20_protocol 30_route 40_relay 50_v2ray_api 60_user_db 61_user_manager; do source "lib/$module.sh"; done
+for module in 00_base 01_utils 10_config 20_protocol 30_route 50_v2ray_api 60_user_db 61_user_manager; do source "lib/$module.sh"; done
 out=${1:?fixture directory}; base=${2:?base port}
 mkdir -p "$out"
 ensure_self_signed_cert() { :; }

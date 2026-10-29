@@ -16,9 +16,20 @@ ensure_deps_for_installer() {
   install_pkg jq
   install_pkg openssl
   install_pkg tar
+  # bash 是本脚本的硬依赖：Alpine / 极简系统默认只有 busybox ash。
+  # 引导段（00_base.sh 顶部）已尝试装过一次，这里兜底确保后续能正常升级。
+  install_pkg bash || true
   case "$PKG_MANAGER" in
-    apt) install_pkg ca-certificates; install_pkg gnupg; install_pkg gzip; install_pkg util-linux ;;
-    apk) install_pkg ca-certificates; install_pkg gcompat; install_pkg flock ;;
+    apt)
+      install_pkg ca-certificates; install_pkg gnupg; install_pkg gzip; install_pkg util-linux
+      ;;
+    apk)
+      install_pkg ca-certificates
+      install_pkg gcompat
+      # flock 在不同 Alpine 版本里可能由独立包或 util-linux 提供，
+      # 两者都失败时不阻断安装（缺少会被 with_manager_lock 拦下并提示）。
+      install_pkg flock || install_pkg util-linux || true
+      ;;
   esac
 }
 
@@ -930,14 +941,6 @@ sync_system_time_chrony() {
 
 # ---------- 卸载 ----------
 
-wireproxy_warp_environment_present() {
-  [ -s /etc/wireguard/proxy.conf ] && return 0
-  local_warp_socks_proxy_url >/dev/null 2>&1 && return 0
-  if has_cmd pgrep && pgrep -x wireproxy >/dev/null 2>&1; then
-    return 0
-  fi
-  return 1
-}
 
 print_full_cleanup_hint() {
   echo
@@ -951,15 +954,6 @@ print_full_cleanup_hint() {
   echo "rm -rf /var/lock/singbox-tg-agent.lock.d"
 }
 
-print_wireproxy_cleanup_hint_if_present() {
-  wireproxy_warp_environment_present || return 0
-  echo
-  echo "检测到 WireProxy/WARP 仍存在。"
-  echo
-  echo "如需卸载 WARP，可在退出脚本后执行："
-  echo "wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh"
-  echo "bash menu.sh u"
-}
 
 uninstall_singbox_keep_config() {
   require_root
@@ -1020,6 +1014,5 @@ uninstall_singbox_keep_config() {
   refresh_command_cache
   ok "卸载完成，配置和用户数据已保留。"
   print_full_cleanup_hint
-  print_wireproxy_cleanup_hint_if_present
   pause
 }

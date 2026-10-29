@@ -3,7 +3,7 @@
 # 模块: 70_export.sh
 # 职责: 客户端配置导出（链接生成 + 多格式输出）
 # 依赖: 00_base.sh, 01_utils.sh, 10_config.sh, 20_protocol.sh,
-#       30_route.sh, 40_relay.sh, 50_v2ray_api.sh
+#       30_route.sh, 50_v2ray_api.sh
 # ============================================================
 
 # ---------- 编码工具 ----------
@@ -108,11 +108,14 @@ export_collect_context() {
   vm_domain="example.com"
   inventory="$(protocol_entry_inventory "$json")"
 
-  if printf '%s\n' "$inventory" | awk -F '\x01' '$2 == "vless-ws" {found=1} END{exit !found}'; then
+  # 分隔符用 POSIX 八进制 \001 而非十六进制 \x01：busybox awk（Alpine 默认）
+  # 不认 \xHH 转义，会把 '\x01' 当成字面量 x01，导致字段永不匹配。
+  # 八进制写法 gawk / mawk / busybox awk 三者都支持。
+  if printf '%s\n' "$inventory" | awk -F '\001' '$2 == "vless-ws" {found=1} END{exit !found}'; then
     read -r -p "请输入 vless-ws 域名（默认: example.com）: " ws_domain
     ws_domain="${ws_domain:-example.com}"
   fi
-  if printf '%s\n' "$inventory" | awk -F '\x01' '$2 == "vmess-ws" {found=1} END{exit !found}'; then
+  if printf '%s\n' "$inventory" | awk -F '\001' '$2 == "vmess-ws" {found=1} END{exit !found}'; then
     read -r -p "请输入 vmess-ws 域名（默认: example.com）: " vm_domain
     vm_domain="${vm_domain:-example.com}"
   fi
@@ -125,7 +128,7 @@ export_collect_context() {
 export_configs() {
   init_manager_env || { pause; return 0; }
   clear
-  local json ctx ip ws_domain vm_domain relay_users_nl
+  local json ctx ip ws_domain vm_domain
   local tag proto port sni path sid method server_p
   local name uuid pass flow out_name pw_out target_file business_user safe_user reality_public_key v2rayn_link
   json="$(config_load)"
@@ -133,17 +136,15 @@ export_configs() {
   IFS=$'\x01' read -r ip ws_domain vm_domain < <(
     echo "$ctx" | jq -r '[.ip, .ws_domain, .vm_domain] | join("\u0001")'
   )
-  relay_users_nl="$(relay_list_table "$json" | awk -F '\x01' 'NF >= 2 {print $2}' | awk 'NF' | sort -u)"
 
   echo -e "${C}--- 节点配置导出 ---${NC}"
 
-  local direct_tmp relay_tmp user_dir
+  local direct_tmp user_dir
   direct_tmp="$(mktemp)"
-  relay_tmp="$(mktemp)"
   user_dir="$(mktemp -d)"
   _export_cleanup() {
     rm -rf "$user_dir" >/dev/null 2>&1 || true
-    rm -f "$direct_tmp" "$relay_tmp" >/dev/null 2>&1 || true
+    rm -f "$direct_tmp" >/dev/null 2>&1 || true
   }
   trap '_export_cleanup; trap - RETURN' RETURN
 
@@ -169,8 +170,6 @@ export_configs() {
         business_user="$(user_business_name "$name")"
         safe_user="$(printf '%s' "$business_user" | tr '/ ' '__')"
         target_file="${user_dir}/${safe_user}.tmp"
-      elif printf '%s\n' "$relay_users_nl" | grep -Fxq "$name"; then
-        target_file="$relay_tmp"
       else
         target_file="$direct_tmp"
       fi
@@ -289,13 +288,6 @@ export_configs() {
     cat "$direct_tmp"
   else
     echo -e "  ${Y}当前没有直连节点。${NC}"
-  fi
-
-  echo -e "\n${C}中转节点${NC}"
-  if [ -s "$relay_tmp" ]; then
-    cat "$relay_tmp"
-  else
-    echo -e "  ${Y}当前没有中转节点。${NC}"
   fi
 
   local user_file printed=0 user_name

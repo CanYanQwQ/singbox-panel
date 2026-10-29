@@ -15,11 +15,9 @@ main_menu() {
     echo -e "  ${C}1.${NC} 安装/更新 sing-box"
     echo -e "  ${C}2.${NC} 系统工具"
     echo -e "  ${C}3.${NC} 协议管理"
-    echo -e "  ${C}4.${NC} 中转管理"
-    echo -e "  ${C}5.${NC} warp分流"
-    echo -e "  ${C}6.${NC} 导出节点配置"
-    echo -e "  ${C}7.${NC} 用户管理"
-    echo -e "  ${C}8.${NC} 卸载 sing-box"
+    echo -e "  ${C}4.${NC} 导出节点配置"
+    echo -e "  ${C}5.${NC} 用户管理"
+    echo -e "  ${C}6.${NC} 卸载 sing-box"
     echo -e "  ${R}0.${NC} 退出系统"
     echo -e "${B}--------------------------------------------------------${NC}"
     read -r -p "请选择操作指令: " opt
@@ -27,11 +25,9 @@ main_menu() {
       1) install_or_update_singbox ;;
       2) system_tools_menu || true ;;
       3) protocol_manager || true ;;
-      4) manage_relay_nodes || true ;;
-      5) warp_manager_menu || true ;;
-      6) export_configs || true ;;
-      7) user_manager_menu || true ;;
-      8) uninstall_singbox_keep_config ;;
+      4) export_configs || true ;;
+      5) user_manager_menu || true ;;
+      6) uninstall_singbox_keep_config ;;
       0|q|Q) exit 0 ;;
       *) warn "无效输入：$opt"; sleep 1 ;;
     esac

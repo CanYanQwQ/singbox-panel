@@ -4,6 +4,97 @@
 # 职责: 全局常量、颜色码、UI 基础函数、协议注册表、共享 jq 模板
 # ============================================================
 
+# ============================================================
+# 解释器引导（POSIX sh 兼容，必须位于任何 bash 专有语法之前）
+# ------------------------------------------------------------
+# 本脚本需要 bash 4+（关联数组、mapfile、$'\x01'、[[ ]]）。
+# 但 Alpine / 极简系统默认只有 busybox ash，连 bash 都可能没装，
+# 此时 `bash /root/sb.sh` 会直接 "bash: not found"，脚本一行都跑不到。
+#
+# 这里用纯 POSIX 语法做一次引导：无论用户用 `sh sb.sh`、`ash sb.sh`
+# 还是 `dash sb.sh` 启动，都会在这里换成 bash 并重新执行自身；
+# 系统没有 bash 时先按包管理器自动装上。
+#
+# ash/dash 是逐条读取执行的，下方的 bash 专有语法在 exec 成功替换
+# 进程后永远不会被解析，因此这段引导可以安全地放在同一文件里。
+#
+# 注意：判据不能用 `command -v bash`。busybox 自带一个名为 bash 的
+# applet，它其实是 ash 的别名——`command -v bash` 会成功返回，但那个
+# "bash" 里 BASH_VERSION 依然为空，于是脚本 exec 自己、再 exec 自己，
+# 变成无限递归（极简/嵌入式系统上尤其常见）。唯一可靠的判据是让候选
+# 解释器真的跑一次并报出 BASH_VERSION。
+# ============================================================
+if [ -z "${BASH_VERSION:-}" ]; then
+  # 重入哨兵：已经重执行过一次却仍不是真 bash，就报错退出，
+  # 绝不再 exec 一次（否则就是上面说的死循环）。
+  if [ "${_SB_REEXEC_TRIED:-0}" = "1" ]; then
+    echo "[ERROR] 当前 shell 不是真 bash（BASH_VERSION 为空），重执行也未能启动 bash。" >&2
+    echo "        系统里的 bash 可能只是 busybox 的同名别名，请先安装真正的 bash：" >&2
+    echo "        Alpine: apk add bash" >&2
+    echo "        Debian/Ubuntu: apt-get install -y bash" >&2
+    exit 1
+  fi
+  _SB_REEXEC_TRIED=1
+  export _SB_REEXEC_TRIED
+
+  # 真 bash 判据：能报出非空的 BASH_VERSION。
+  # 用 $( ) 捕获而不是写临时文件：$( ) 是纯 POSIX，不需要 /tmp 可写，
+  # 在只读根文件系统（Docker scratch、OpenWrt、部分极简镜像）上也能用。
+  # 不用 [ -x ] 预判：精简环境的权限位/挂载选项不可信，直接试着执行、
+  # 只看它吐不吐 BASH_VERSION 才是唯一稳的判据。
+  _sb_is_real_bash() {
+    [ -n "$( "$1" -c 'printf %s "${BASH_VERSION:-}"' 2>/dev/null )" ]
+  }
+
+  _sb_find_and_exec_bash() {
+    # 直接试绝对路径，不走 command -v，避免命中 busybox 的同名别名
+    for _sb_b in bash /bin/bash /usr/bin/bash /usr/local/bin/bash \
+                 /bin/bash4 /usr/bin/bash4; do
+      if _sb_is_real_bash "$_sb_b"; then
+        exec "$_sb_b" "$0" "$@"
+      fi
+    done
+    return 1
+  }
+
+  # $0 为 sh/bash 本身（例如 curl | sh）时无法自我重执行
+  case "$0" in
+    sh|bash|dash|ash|*/sh|*/bash|*/dash|*/ash|"")
+      echo "[ERROR] 检测到缺少 bash，且当前为管道或交互式执行，无法自动重启动。" >&2
+      echo "        请先下载为文件再运行：curl -fsSL <url> -o /root/sb.sh && sh /root/sb.sh" >&2
+      exit 1
+      ;;
+  esac
+
+  _sb_find_and_exec_bash "$@" || true
+
+  # 没找到真 bash：按包管理器安装后重试一次
+  echo "[INFO] 未找到可用的 bash，正在尝试自动安装..." >&2
+  if command -v apk >/dev/null 2>&1; then
+    apk add --no-cache bash >/dev/null 2>&1 || true
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y bash >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y bash >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y bash >/dev/null 2>&1 || true
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper install -y bash >/dev/null 2>&1 || true
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -S --noconfirm bash >/dev/null 2>&1 || true
+  fi
+
+  _sb_find_and_exec_bash "$@" || true
+
+  echo "[ERROR] 无法安装 bash。请先手动安装再运行本脚本：" >&2
+  echo "        Alpine: apk add bash" >&2
+  echo "        Debian: apt-get install -y bash" >&2
+  exit 1
+fi
+unset _SB_REEXEC_TRIED 2>/dev/null || true
+
+# 至此已确认运行在 bash 下，后续可安全使用 bash 专有语法。
 set -Eeuo pipefail
 
 # -------------------- 版本 --------------------
@@ -294,3 +385,4 @@ sort_tsv_by_protocol() {
     printf '%s\t%s\n' "$(node_protocol_sort_key "$fval")" "$line"
   done | sort -t$'\t' -k1,1 | cut -f2-
 }
+
